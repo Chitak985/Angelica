@@ -5,7 +5,7 @@ import com.gtnewhorizons.angelica.glsm.ffp.FfpExtendedAttribs;
 import com.gtnewhorizons.angelica.glsm.hooks.ImmediateExtendedAttribHandler;
 import com.gtnewhorizons.angelica.rendering.items.ItemRenderListManager;
 import com.gtnewhorizons.angelica.rendering.tesr.TesrBatchRenderer;
-import it.unimi.dsi.fastutil.ints.Int2BooleanOpenHashMap;
+import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import net.coderbot.iris.Iris;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.ITextureObject;
@@ -34,25 +34,30 @@ public final class ImmediateExtendedAttribs implements ImmediateExtendedAttribHa
 
     private static final float POM_MAX_TILE_EXTENT = 0.125f;
 
-    private static volatile boolean currentProgramWantsExt = false;
+    private static final int WANTS_MID = 1;
+    private static final int WANTS_TANGENT = 2;
 
-    private static final Int2BooleanOpenHashMap programWantsExtCache = new Int2BooleanOpenHashMap();
+    private static final int NEUTRAL_TANGENT = NormI8.pack(1.0f, 0.0f, 0.0f, 1.0f);
+
+    private static volatile int currentProgramWants = 0;
+
+    private static final Int2IntOpenHashMap programWantsExtCache = new Int2IntOpenHashMap();
 
     public static void onProgramBound(int program) {
         if (program == 0) {
-            currentProgramWantsExt = false;
+            currentProgramWants = 0;
             return;
         }
-        boolean wants;
+        int wants;
         if (programWantsExtCache.containsKey(program)) {
             wants = programWantsExtCache.get(program);
         } else {
-            final int midLoc = GLStateManager.glGetAttribLocation(program, "mc_midTexCoord");
-            final int tanLoc = GLStateManager.glGetAttribLocation(program, "at_tangent");
-            wants = midLoc >= 0 || tanLoc >= 0;
+            wants = 0;
+            if (GLStateManager.glGetAttribLocation(program, "mc_midTexCoord") >= 0) wants |= WANTS_MID;
+            if (GLStateManager.glGetAttribLocation(program, "at_tangent") >= 0) wants |= WANTS_TANGENT;
             programWantsExtCache.put(program, wants);
         }
-        currentProgramWantsExt = wants;
+        currentProgramWants = wants;
     }
 
     public static void onProgramDeleted(int program) {
@@ -60,7 +65,7 @@ public final class ImmediateExtendedAttribs implements ImmediateExtendedAttribHa
     }
 
     public static void onShaderPackChanged() {
-        currentProgramWantsExt = false;
+        currentProgramWants = 0;
         programWantsExtCache.clear();
         ItemRenderListManager.clearCache();
         FfpExtendedAttribs.reset();
@@ -72,10 +77,16 @@ public final class ImmediateExtendedAttribs implements ImmediateExtendedAttribHa
     private final PackedQuadView packedQuad = new PackedQuadView();
 
     private boolean limitTileExtent = true;
+    private boolean needTangent = true;
 
     @Override
     public boolean wantsExtended() {
-        return Iris.enabled && currentProgramWantsExt && GLStateManager.getActiveProgram() != 0;
+        return Iris.enabled && currentProgramWants != 0 && GLStateManager.getActiveProgram() != 0;
+    }
+
+    @Override
+    public boolean wantsTangent() {
+        return (currentProgramWants & WANTS_TANGENT) != 0;
     }
 
     @Override
@@ -87,6 +98,7 @@ public final class ImmediateExtendedAttribs implements ImmediateExtendedAttribHa
     public void build(int[] rawBuffer, int vertexCount, int vertsPerPrim, int normalIntIndex, long dstAddr, int dstStride) {
         final boolean smooth = normalIntIndex >= 0;
         limitTileExtent = isAtlasNotBound();
+        needTangent = wantsTangent();
         long ptr = dstAddr;
         for (int v = 0; v < vertexCount; v += vertsPerPrim) {
             quad.setup(rawBuffer, v, normalIntIndex);
@@ -104,6 +116,7 @@ public final class ImmediateExtendedAttribs implements ImmediateExtendedAttribHa
                             int vertexCount, int vertsPerPrim, long dstAddr, int dstStride) {
         final boolean smooth = normalOffset >= 0;
         limitTileExtent = isAtlasNotBound();
+        needTangent = wantsTangent();
         long ptr = dstAddr;
         for (int v = 0; v < vertexCount; v += vertsPerPrim) {
             packedQuad.setup(srcBase + (long) v * stride, stride, posOffset, texOffset, normalOffset);
@@ -126,8 +139,13 @@ public final class ImmediateExtendedAttribs implements ImmediateExtendedAttribHa
         final boolean tileable = formsRectAxisQuad(u0, u1, u2, u3) && formsRectAxisQuad(v0, v1, v2, v3)
             && (!limitTileExtent || ((umax - umin) <= POM_MAX_TILE_EXTENT && (vmax - vmin) <= POM_MAX_TILE_EXTENT));
 
-        NormalHelper.computeFaceNormal(normal, quad);
-        final int tangent = NormalHelper.computeTangent(normal.x, normal.y, normal.z, quad);
+        final int tangent;
+        if (needTangent) {
+            NormalHelper.computeFaceNormal(normal, quad);
+            tangent = NormalHelper.computeTangent(normal.x, normal.y, normal.z, quad);
+        } else {
+            tangent = NEUTRAL_TANGENT;
+        }
 
         long ptr = dstAddr;
         if (!tileable) {
@@ -171,15 +189,22 @@ public final class ImmediateExtendedAttribs implements ImmediateExtendedAttribHa
         if (smooth) {
             for (int i = 0; i < 3; i++) {
                 final int n = view.packedNormal(i);
-                final int tangent = NormalHelper.computeTangentSmooth(NormI8.unpackX(n), NormI8.unpackY(n), NormI8.unpackZ(n), view);
+                final int tangent = needTangent
+                    ? NormalHelper.computeTangentSmooth(NormI8.unpackX(n), NormI8.unpackY(n), NormI8.unpackZ(n), view)
+                    : NEUTRAL_TANGENT;
                 memPutFloat(ptr, midU);
                 memPutFloat(ptr + 4, midV);
                 memPutInt(ptr + 8, tangent);
                 ptr += dstStride;
             }
         } else {
-            NormalHelper.computeFaceNormalTri(normal, view);
-            final int tangent = NormalHelper.computeTangent(normal.x, normal.y, normal.z, view);
+            final int tangent;
+            if (needTangent) {
+                NormalHelper.computeFaceNormalTri(normal, view);
+                tangent = NormalHelper.computeTangent(normal.x, normal.y, normal.z, view);
+            } else {
+                tangent = NEUTRAL_TANGENT;
+            }
             for (int i = 0; i < 3; i++) {
                 memPutFloat(ptr, midU);
                 memPutFloat(ptr + 4, midV);
@@ -190,8 +215,13 @@ public final class ImmediateExtendedAttribs implements ImmediateExtendedAttribHa
     }
 
     private void writeTriSuppressed(NormalSource view, long dstAddr, int dstStride) {
-        NormalHelper.computeFaceNormalTri(normal, view);
-        final int tangent = NormalHelper.computeTangent(normal.x, normal.y, normal.z, view);
+        final int tangent;
+        if (needTangent) {
+            NormalHelper.computeFaceNormalTri(normal, view);
+            tangent = NormalHelper.computeTangent(normal.x, normal.y, normal.z, view);
+        } else {
+            tangent = NEUTRAL_TANGENT;
+        }
         long ptr = dstAddr;
         for (int i = 0; i < 3; i++) {
             memPutFloat(ptr, view.u(i) + POM_SUPPRESS_EPS);

@@ -17,6 +17,8 @@ public interface ImmediateExtendedAttribHandler {
 
     boolean wantsExtended();
 
+    boolean wantsTangent();
+
     boolean wantsExtendedCapture();
 
     void build(int[] rawBuffer, int vertexCount, int vertsPerPrim, int normalIntIndex, long dstAddr, int dstStride);
