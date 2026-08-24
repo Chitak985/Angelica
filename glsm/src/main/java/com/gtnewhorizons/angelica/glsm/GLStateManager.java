@@ -7056,13 +7056,13 @@ public class GLStateManager {
     public static void glDeleteProgram(int program) {
         if (program == 0) return;
         CompatUniformManager.onDeleteProgram(program);
+
+        // GL defers deletion of a bound program until unbind; activeProgram stays set so the
+        // cache matches GL_CURRENT_PROGRAM and the next glUseProgram is not skipped as redundant.
         if (GLSMHooks.PROGRAM_DELETE.hasListeners()) {
             GLSMHooks.programDeleteEvent.program = program;
             GLSMHooks.PROGRAM_DELETE.post(GLSMHooks.programDeleteEvent);
         }
-
-        // GL defers deletion of a bound program until unbind; activeProgram stays set so the
-        // cache matches GL_CURRENT_PROGRAM and the next glUseProgram is not skipped as redundant.
         RENDER_BACKEND.deleteProgram(program);
     }
 
