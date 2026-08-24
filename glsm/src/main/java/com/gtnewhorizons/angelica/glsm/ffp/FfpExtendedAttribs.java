@@ -5,13 +5,19 @@ import com.gtnewhorizon.gtnhlib.client.renderer.vertex.VertexFormatElement.Usage
 import com.gtnewhorizons.angelica.glsm.GLStateManager;
 import com.gtnewhorizons.angelica.glsm.hooks.GLSMHooks;
 import com.gtnewhorizons.angelica.glsm.hooks.ImmediateExtendedAttribHandler;
+import it.unimi.dsi.fastutil.ints.Int2IntMap;
+import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
+import it.unimi.dsi.fastutil.ints.IntSet;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
 import it.unimi.dsi.fastutil.objects.ObjectSet;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
+import org.lwjgl.opengl.GL31;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -28,11 +34,8 @@ import static com.gtnewhorizons.angelica.glsm.backend.BackendManager.RENDER_BACK
 
 /**
  * Supplies {@code mc_midTexCoord}/{@code at_tangent} for mod geometry drawn through the FFPclient-array path
- * ({@code glVertexPointer}/{@code glTexCoordPointer} + {@code glDrawArrays}), which bypasses the Tessellator
- * and display-list ext-injection paths.
- *
- * <p>The ext buffer is built from a one-time GPU readback of the source VBO, cached per VBO handle and range so a
- * redraw of the same geometry is a cache hit. Entries are dropped when the source VBO is deleted or respecified.
+ * ({@code glVertexPointer}/{@code glTexCoordPointer} + {@code glDrawArrays}) out of a VBO, which bypasses the
+ * Tessellator and display-list ext-injection paths.
  *
  * <p>Tangents are reconstructed from the flat face normal (handler's {@code normalOffset < 0} path).
  */
@@ -47,17 +50,30 @@ public final class FfpExtendedAttribs {
     private static final int SRC_NORMAL_OFFSET = 20;
     private static final int SRC_STRIDE_FLAT = 20;
     private static final int SRC_STRIDE_SMOOTH = 24;
-    private static final int MAX_CACHE = 4096;
+    private static final int MAX_CACHE = 1024;
+    private static final int MAX_EXT_VERTS = 1 << 20;
+    private static final int MAX_RESPECS = 8;
+    private static final int RESPEC_DECAY_FRAMES = 2;
+    private static final int MIN_STREAM_SPAN_FRAMES = 4;
+    private static final int STREAM_EXPIRE_FRAMES = 60;
 
-    private static final HashMap<Key, Integer> cache = new HashMap<>();
+    private static final HashMap<Key, ExtBuffer> cache = new HashMap<>();
     private static final Key lookup = new Key();
-    private static boolean purging = false;
+    private static int internalGlDepth = 0;
 
     private static final HashMap<EboKey, Boolean> eboPatternCache = new HashMap<>();
     private static final EboKey eboLookup = new EboKey();
 
     private static final Int2ObjectMap<ObjectSet<Key>> keysBySource = new Int2ObjectOpenHashMap<>();
     private static final Int2ObjectMap<ObjectSet<EboKey>> eboKeysBySource = new Int2ObjectOpenHashMap<>();
+    private static final Int2IntMap respecCounts = new Int2IntOpenHashMap();
+    private static final Int2IntMap respecFrames = new Int2IntOpenHashMap();
+    private static final Int2IntMap respecRunStart = new Int2IntOpenHashMap();
+    private static final IntSet streamingSources = new IntOpenHashSet();
+    private static final IntSet persistentSources = new IntOpenHashSet();
+    private static int frame;
+
+    public static void endFrame() { frame++; }
 
     public static boolean isEmpty() {
         return cache.isEmpty() && eboPatternCache.isEmpty();
@@ -69,8 +85,23 @@ public final class FfpExtendedAttribs {
 
     public static void endInternalDraw() { if (internalDrawDepth > 0) internalDrawDepth--; }
 
+    private static void beginInternalGl() { internalGlDepth++; }
+
+    private static void endInternalGl() { if (internalGlDepth > 0) internalGlDepth--; }
+
     private static boolean isNotConventionalTexturedArray(VAOManager.Attrib a) {
         return a == null || !a.enabled || a.genericPointer || a.vboId == 0 || a.size < 2;
+    }
+
+    private static boolean isStreaming(int vboId) {
+        if (vboId == 0 || !streamingSources.contains(vboId)) return false;
+        if (persistentSources.contains(vboId)) return true;
+        if (frame - respecFrames.get(vboId) > STREAM_EXPIRE_FRAMES) {
+            streamingSources.remove(vboId);
+            respecFrames.remove(vboId);
+            return false;
+        }
+        return true;
     }
 
     public static boolean maybeBind(int mode, int first, int count) {
@@ -84,9 +115,11 @@ public final class FfpExtendedAttribs {
         final VAOManager.Attrib pos = VAOManager.get(POSITION_LOC);
         final VAOManager.Attrib uv = VAOManager.get(UV_LOC);
         if (isNotConventionalTexturedArray(pos) || isNotConventionalTexturedArray(uv)) return false;
+        if (isStreaming(pos.vboId) || isStreaming(uv.vboId)) return false;
 
         VAOManager.Attrib normal = extPrim == 3 ? VAOManager.get(NORMAL_LOC) : null;
-        if (normal != null && (!normal.enabled || normal.genericPointer || normal.vboId == 0 || normal.size < 3)) {
+        if (normal != null && (!normal.enabled || normal.genericPointer || normal.vboId == 0 || normal.size < 3
+            || isStreaming(normal.vboId))) {
             normal = null;
         }
 
@@ -103,6 +136,7 @@ public final class FfpExtendedAttribs {
         final VAOManager.Attrib pos = VAOManager.get(POSITION_LOC);
         final VAOManager.Attrib uv = VAOManager.get(UV_LOC);
         if (isNotConventionalTexturedArray(pos) || isNotConventionalTexturedArray(uv)) return false;
+        if (isStreaming(pos.vboId) || isStreaming(uv.vboId) || isStreaming(VAOManager.boundEBO)) return false;
 
         final int indexSize = indexTypeBytes(indexType);
         if (indexSize == 0) return false;
@@ -184,35 +218,97 @@ public final class FfpExtendedAttribs {
     public static void unbind() {
         GLStateManager.glDisableVertexAttribArray(ImmediateExtendedAttribHandler.LOC_MID_TEX);
         GLStateManager.glDisableVertexAttribArray(ImmediateExtendedAttribHandler.LOC_TANGENT);
+        setNeutralCurrentValues();
+    }
+
+    public static void setNeutralCurrentValues() {
+        GLStateManager.glVertexAttrib2f(ImmediateExtendedAttribHandler.LOC_MID_TEX, 0.5f, 0.5f);
+        GLStateManager.glVertexAttrib4f(ImmediateExtendedAttribHandler.LOC_TANGENT, 1.0f, 0.0f, 0.0f, 1.0f);
     }
 
     public static void onDeleteBuffer(int vboId) {
-        if (purging || vboId == 0) return;
+        if (internalGlDepth > 0 || vboId == 0) return;
         dropDerivedFrom(vboId);
+        respecCounts.remove(vboId);
+        respecFrames.remove(vboId);
+        respecRunStart.remove(vboId);
+        streamingSources.remove(vboId);
+        persistentSources.remove(vboId);
     }
 
     public static void onBufferRespecified(int vboId) {
-        if (purging || vboId == 0) return;
-        dropDerivedFrom(vboId);
+        if (internalGlDepth > 0 || vboId == 0) return;
+        if (streamingSources.contains(vboId)) {
+            respecFrames.put(vboId, frame);
+            return;
+        }
+        if (!dropDerivedFrom(vboId)) return;
+        final boolean sameRun = respecCounts.containsKey(vboId) && frame - respecFrames.get(vboId) <= RESPEC_DECAY_FRAMES;
+        if (!sameRun) {
+            startRespecRun(vboId);
+            return;
+        }
+        final int respecs = respecCounts.get(vboId) + 1;
+        final int span = frame - respecRunStart.get(vboId);
+        if (respecs >= MAX_RESPECS && span >= MIN_STREAM_SPAN_FRAMES && span <= respecs) {
+            markStreaming(vboId);
+            return;
+        }
+        if (span > respecs) {
+            startRespecRun(vboId);
+            return;
+        }
+        respecCounts.put(vboId, respecs);
+        respecFrames.put(vboId, frame);
     }
 
-    private static void dropDerivedFrom(int srcId) {
+    private static void startRespecRun(int vboId) {
+        respecCounts.put(vboId, 1);
+        respecRunStart.put(vboId, frame);
+        respecFrames.put(vboId, frame);
+    }
+
+    public static void markStreaming(int vboId) {
+        if (internalGlDepth > 0 || vboId == 0) return;
+        respecCounts.remove(vboId);
+        respecRunStart.remove(vboId);
+        respecFrames.put(vboId, frame);
+        if (streamingSources.add(vboId)) dropDerivedFrom(vboId);
+    }
+
+    public static void markPersistent(int vboId) {
+        if (internalGlDepth > 0 || vboId == 0) return;
+        markStreaming(vboId);
+        persistentSources.add(vboId);
+    }
+
+    public static void reset() {
+        invalidateAll();
+        respecCounts.clear();
+        respecFrames.clear();
+        respecRunStart.clear();
+        streamingSources.clear();
+        persistentSources.clear();
+    }
+
+    private static boolean dropDerivedFrom(int srcId) {
         final ObjectSet<EboKey> ebos = eboKeysBySource.remove(srcId);
         if (ebos != null) {
             for (EboKey k : ebos) eboPatternCache.remove(k);
         }
         final ObjectSet<Key> keys = keysBySource.get(srcId);
-        if (keys == null || keys.isEmpty()) return;
+        if (keys == null || keys.isEmpty()) return ebos != null;
         IntArrayList toFree = null;
         for (Key k : keys.toArray(new Key[0])) {
-            final Integer ext = cache.remove(k);
-            if (ext != null) {
+            final ExtBuffer buf = cache.remove(k);
+            if (buf != null && buf.vbo != 0) {
                 if (toFree == null) toFree = new IntArrayList();
-                toFree.add(ext.intValue());
+                toFree.add(buf.vbo);
             }
             unindexKey(k);
         }
         freeExtVbos(toFree);
+        return true;
     }
 
     private static void indexKey(Key k) {
@@ -242,27 +338,58 @@ public final class FfpExtendedAttribs {
 
     private static int getOrBuild(ImmediateExtendedAttribHandler h, VAOManager.Attrib pos, VAOManager.Attrib uv,
                                   VAOManager.Attrib normal, int first, int count, int extPrim, int mode) {
-        final int nVbo = normal != null ? normal.vboId : 0;
-        final long nOff = normal != null ? normal.offset : 0L;
-        final int nStride = normal != null ? normal.effectiveStride() : 0;
-        lookup.set(pos.vboId, pos.offset, pos.effectiveStride(), uv.vboId, uv.offset, uv.effectiveStride(),
-            nVbo, nOff, nStride, first, count, mode);
-        final Integer hit = cache.get(lookup);
-        if (hit != null) return hit;
-
-        if (cache.size() >= MAX_CACHE) invalidateAll();
-
-        final int extVbo = buildExtVbo(h, pos, uv, normal, first, count, extPrim);
-        if (extVbo != 0) {
+        if (first + count > MAX_EXT_VERTS) return 0;
+        lookup.set(pos, uv, normal, mode, first % extPrim);
+        ExtBuffer buf = cache.get(lookup);
+        if (buf == null) {
+            if (cache.size() >= MAX_CACHE) invalidateExtBuffers();
+            buf = new ExtBuffer();
             final Key stored = lookup.copy();
-            cache.put(stored, extVbo);
+            cache.put(stored, buf);
             indexKey(stored);
         }
-        return extVbo;
+
+        final long range = (long) first << 32 | (count & 0xFFFFFFFFL);
+        if (buf.vbo != 0 && buf.builtRanges.contains(range)) return buf.vbo;
+        if (!ensureCapacity(buf, first + count)) return 0;
+        buildRange(h, buf.vbo, pos, uv, normal, first, count, extPrim);
+        buf.builtRanges.add(range);
+        return buf.vbo;
     }
 
-    private static int buildExtVbo(ImmediateExtendedAttribHandler h, VAOManager.Attrib pos, VAOManager.Attrib uv,
-                                   VAOManager.Attrib normal, int first, int count, int extPrim) {
+    private static boolean ensureCapacity(ExtBuffer buf, int neededVerts) {
+        if (buf.vbo != 0 && buf.capacityVerts >= neededVerts) return true;
+        final int extStride = ImmediateExtendedAttribHandler.EXT_STRIDE;
+        final int newCap = Math.min(MAX_EXT_VERTS, Math.max(neededVerts, buf.capacityVerts * 2));
+        beginInternalGl();
+        try {
+            final int vbo = GLStateManager.glGenBuffers();
+            if (vbo == 0) return false;
+            final int savedVBO = GLStateManager.getBoundVBO();
+            GLStateManager.glBindBuffer(GL15.GL_ARRAY_BUFFER, vbo);
+            GLStateManager.glBufferData(GL15.GL_ARRAY_BUFFER, (long) newCap * extStride, GL15.GL_STATIC_DRAW);
+            GLStateManager.glBindBuffer(GL15.GL_ARRAY_BUFFER, savedVBO);
+            if (buf.vbo != 0) {
+                final int savedRead = GLStateManager.getBoundCopyReadBuffer();
+                final int savedWrite = GLStateManager.getBoundCopyWriteBuffer();
+                GLStateManager.glBindBuffer(GL31.GL_COPY_READ_BUFFER, buf.vbo);
+                GLStateManager.glBindBuffer(GL31.GL_COPY_WRITE_BUFFER, vbo);
+                GLStateManager.glCopyBufferSubData(GL31.GL_COPY_READ_BUFFER, GL31.GL_COPY_WRITE_BUFFER, 0L, 0L,
+                    (long) buf.capacityVerts * extStride);
+                GLStateManager.glBindBuffer(GL31.GL_COPY_READ_BUFFER, savedRead);
+                GLStateManager.glBindBuffer(GL31.GL_COPY_WRITE_BUFFER, savedWrite);
+                GLStateManager.glDeleteBuffers(buf.vbo);
+            }
+            buf.vbo = vbo;
+            buf.capacityVerts = newCap;
+            return true;
+        } finally {
+            endInternalGl();
+        }
+    }
+
+    private static void buildRange(ImmediateExtendedAttribHandler h, int extVbo, VAOManager.Attrib pos,
+                                   VAOManager.Attrib uv, VAOManager.Attrib normal, int first, int count, int extPrim) {
         final int posStride = pos.effectiveStride();
         final int uvStride = uv.effectiveStride();
         final boolean smooth = normal != null;
@@ -295,20 +422,22 @@ public final class FfpExtendedAttribs {
         final ByteBuffer ext = memCalloc(count, extStride);
         h.buildPacked(memAddress0(src), srcStride, 0, SRC_TEX_OFFSET, srcNormalOffset, count, extPrim, memAddress0(ext), extStride);
 
-        final int extVbo = GLStateManager.glGenBuffers();
-        final int savedVBO = GLStateManager.getBoundVBO();
-        GLStateManager.glBindBuffer(GL15.GL_ARRAY_BUFFER, extVbo);
-        GLStateManager.glBufferData(GL15.GL_ARRAY_BUFFER, (long) (first + count) * extStride, GL15.GL_STATIC_DRAW);
-        ext.position(0).limit(count * extStride);
-        GLStateManager.glBufferSubData(GL15.GL_ARRAY_BUFFER, (long) first * extStride, ext);
-        GLStateManager.glBindBuffer(GL15.GL_ARRAY_BUFFER, savedVBO);
+        beginInternalGl();
+        try {
+            final int savedVBO = GLStateManager.getBoundVBO();
+            GLStateManager.glBindBuffer(GL15.GL_ARRAY_BUFFER, extVbo);
+            ext.position(0).limit(count * extStride);
+            GLStateManager.glBufferSubData(GL15.GL_ARRAY_BUFFER, (long) first * extStride, ext);
+            GLStateManager.glBindBuffer(GL15.GL_ARRAY_BUFFER, savedVBO);
+        } finally {
+            endInternalGl();
+        }
 
         memFree(posBuf);
         memFree(uvBuf);
         if (normalBuf != null) memFree(normalBuf);
         memFree(src);
         memFree(ext);
-        return extVbo;
     }
 
     private static ByteBuffer readRange(VAOManager.Attrib a, int first, int count, int stride) {
@@ -325,8 +454,17 @@ public final class FfpExtendedAttribs {
     }
 
     private static void invalidateAll() {
+        eboPatternCache.clear();
+        eboKeysBySource.clear();
+        invalidateExtBuffers();
+    }
+
+    private static void invalidateExtBuffers() {
         if (cache.isEmpty()) return;
-        final IntArrayList toFree = new IntArrayList(cache.values());
+        final IntArrayList toFree = new IntArrayList(cache.size());
+        for (ExtBuffer buf : cache.values()) {
+            if (buf.vbo != 0) toFree.add(buf.vbo);
+        }
         cache.clear();
         keysBySource.clear();
         freeExtVbos(toFree);
@@ -334,14 +472,20 @@ public final class FfpExtendedAttribs {
 
     private static void freeExtVbos(IntArrayList vbos) {
         if (vbos == null || vbos.isEmpty()) return;
-        purging = true;
+        beginInternalGl();
         try {
             for (int i = 0; i < vbos.size(); i++) {
                 GLStateManager.glDeleteBuffers(vbos.getInt(i));
             }
         } finally {
-            purging = false;
+            endInternalGl();
         }
+    }
+
+    private static final class ExtBuffer {
+        int vbo;
+        int capacityVerts;
+        final LongOpenHashSet builtRanges = new LongOpenHashSet();
     }
 
     private static final class EboKey {
@@ -378,21 +522,32 @@ public final class FfpExtendedAttribs {
     }
 
     private static final class Key {
-        int posVBO, uvVBO, normalVBO, posStride, uvStride, normalStride, first, count, mode;
+        int posVBO, uvVBO, normalVBO, posStride, uvStride, normalStride, posFmt, uvFmt, normalFmt, mode, phase;
         long posOffset, uvOffset, normalOffset;
 
-        void set(int posVBO, long posOffset, int posStride, int uvVBO, long uvOffset, int uvStride,
-                 int normalVBO, long normalOffset, int normalStride, int first, int count, int mode) {
-            this.posVBO = posVBO; this.posOffset = posOffset; this.posStride = posStride;
-            this.uvVBO = uvVBO; this.uvOffset = uvOffset; this.uvStride = uvStride;
-            this.normalVBO = normalVBO; this.normalOffset = normalOffset; this.normalStride = normalStride;
-            this.first = first; this.count = count; this.mode = mode;
+        void set(VAOManager.Attrib pos, VAOManager.Attrib uv, VAOManager.Attrib normal, int mode, int phase) {
+            posVBO = pos.vboId; posOffset = pos.offset; posStride = pos.effectiveStride(); posFmt = fmt(pos);
+            uvVBO = uv.vboId; uvOffset = uv.offset; uvStride = uv.effectiveStride(); uvFmt = fmt(uv);
+            if (normal != null) {
+                normalVBO = normal.vboId; normalOffset = normal.offset;
+                normalStride = normal.effectiveStride(); normalFmt = fmt(normal);
+            } else {
+                normalVBO = 0; normalOffset = 0; normalStride = 0; normalFmt = 0;
+            }
+            this.mode = mode;
+            this.phase = phase;
+        }
+
+        private static int fmt(VAOManager.Attrib a) {
+            return (a.size & 0x7F) | (a.normalized ? 0x80 : 0) | (a.type << 8);
         }
 
         Key copy() {
             final Key k = new Key();
-            k.set(posVBO, posOffset, posStride, uvVBO, uvOffset, uvStride,
-                normalVBO, normalOffset, normalStride, first, count, mode);
+            k.posVBO = posVBO; k.posOffset = posOffset; k.posStride = posStride; k.posFmt = posFmt;
+            k.uvVBO = uvVBO; k.uvOffset = uvOffset; k.uvStride = uvStride; k.uvFmt = uvFmt;
+            k.normalVBO = normalVBO; k.normalOffset = normalOffset; k.normalStride = normalStride; k.normalFmt = normalFmt;
+            k.mode = mode; k.phase = phase;
             return k;
         }
 
@@ -401,7 +556,8 @@ public final class FfpExtendedAttribs {
             if (!(o instanceof Key k)) return false;
             return posVBO == k.posVBO && uvVBO == k.uvVBO && normalVBO == k.normalVBO
                 && posStride == k.posStride && uvStride == k.uvStride && normalStride == k.normalStride
-                && first == k.first && count == k.count && mode == k.mode
+                && posFmt == k.posFmt && uvFmt == k.uvFmt && normalFmt == k.normalFmt
+                && mode == k.mode && phase == k.phase
                 && posOffset == k.posOffset && uvOffset == k.uvOffset && normalOffset == k.normalOffset;
         }
 
@@ -413,9 +569,11 @@ public final class FfpExtendedAttribs {
             h = h * 31 + posStride;
             h = h * 31 + uvStride;
             h = h * 31 + normalStride;
-            h = h * 31 + first;
-            h = h * 31 + count;
+            h = h * 31 + posFmt;
+            h = h * 31 + uvFmt;
+            h = h * 31 + normalFmt;
             h = h * 31 + mode;
+            h = h * 31 + phase;
             h = h * 31 + Long.hashCode(posOffset);
             h = h * 31 + Long.hashCode(uvOffset);
             h = h * 31 + Long.hashCode(normalOffset);

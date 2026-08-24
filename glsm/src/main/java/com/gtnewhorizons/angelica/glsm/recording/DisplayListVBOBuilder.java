@@ -73,8 +73,6 @@ public final class DisplayListVBOBuilder {
             final IVertexArrayObject vao = VAOManager.createStorageVAO(format, -1, 0); // drawMode will be ignored
             final IVertexBuffer vbo = vao.getVBO();
 
-            // Quad/triangle draws of this format whose VAOs need the ext attributes attached after upload.
-            final List<IVertexArrayObject> extVaos = wantExt ? new ArrayList<>() : null;
             // SubVBO slots that need the ext attributes attached on their first draw.
             final IntArrayList extDrawIndexes = wantExt ? new IntArrayList() : null;
             final IntArrayList extStarts = wantExt ? new IntArrayList() : null;
@@ -101,7 +99,6 @@ public final class DisplayListVBOBuilder {
                     final IVertexArrayObject indexedVAO = new IndexedVAO(vbo, IndexBuffer.convertQuadsToTrigs(start, start + vertexCount));
                     vbos[data.drawIndex] = new DisplayListVBO.SubVBO(indexedVAO, GL11.GL_TRIANGLES, 0, vertexCount / 4 * 6, flags);
                     if (wantExt) {
-                        extVaos.add(indexedVAO);
                         extDrawIndexes.add(data.drawIndex);
                         extStarts.add(start);
                         extCounts.add(vertexCount);
@@ -111,7 +108,6 @@ public final class DisplayListVBOBuilder {
                     if (wantExt) {
                         final IVertexArrayObject triVao = new BaseVAO(vbo);
                         vbos[data.drawIndex] = new DisplayListVBO.SubVBO(triVao, GL11.GL_TRIANGLES, start, vertexCount, flags);
-                        extVaos.add(triVao);
                         extDrawIndexes.add(data.drawIndex);
                         extStarts.add(start);
                         extCounts.add(vertexCount);
@@ -135,8 +131,8 @@ public final class DisplayListVBOBuilder {
             ByteBuffer bigBuffer = mergeAndDelete(allBuffers);
             vbo.allocate(bigBuffer, start);
 
-            if (wantExt && !extVaos.isEmpty()) {
-                final int extVbo = buildAndAttachExt(extHandler, format, bigBuffer, extVaos, extStarts, extCounts, extPrims);
+            if (wantExt && !extDrawIndexes.isEmpty()) {
+                final int extVbo = buildExt(extHandler, format, bigBuffer, extStarts, extCounts, extPrims);
                 if (extVbo != 0) {
                     extVbos.add(extVbo);
                     for (int e = 0; e < extDrawIndexes.size(); e++) {
@@ -152,10 +148,8 @@ public final class DisplayListVBOBuilder {
         return new DisplayListVBO(vbos, extVbos.toIntArray());
     }
 
-    private static int buildAndAttachExt(ImmediateExtendedAttribHandler handler, VertexFormat format,
-                                         ByteBuffer bigBuffer,
-                                         List<IVertexArrayObject> extVaos, IntArrayList extStarts, IntArrayList extCounts,
-                                         IntArrayList extPrims) {
+    private static int buildExt(ImmediateExtendedAttribHandler handler, VertexFormat format, ByteBuffer bigBuffer,
+                                IntArrayList extStarts, IntArrayList extCounts, IntArrayList extPrims) {
         final int extStride = ImmediateExtendedAttribHandler.EXT_STRIDE;
         final int stride = format.getVertexSize();
         final int posOffset = 0;

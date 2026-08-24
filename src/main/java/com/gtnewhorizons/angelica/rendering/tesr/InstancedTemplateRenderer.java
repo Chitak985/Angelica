@@ -4,6 +4,7 @@ import com.gtnewhorizon.gtnhlib.client.renderer.vertex.VertexFlags;
 import com.gtnewhorizons.angelica.glsm.GLStateManager;
 import com.gtnewhorizons.angelica.glsm.hooks.ImmediateExtendedAttribHandler;
 import com.gtnewhorizons.angelica.glsm.hooks.GLSMHooks;
+import com.gtnewhorizons.angelica.glsm.ffp.FfpExtendedAttribs;
 import com.gtnewhorizons.angelica.glsm.ffp.InstancedAttribs;
 import com.gtnewhorizons.angelica.glsm.ffp.VAOManager;
 import com.gtnewhorizons.angelica.glsm.streaming.OrphanStreamingBuffer;
@@ -101,6 +102,10 @@ final class InstancedTemplateRenderer {
         int draws = 0;
         long recordOffset = ringBase;
         final int ringId = uploadBufferId;
+        final ImmediateExtendedAttribHandler extHandler = GLSMHooks.immediateExtendedHandler;
+        if (extHandler != null && extHandler.wantsExtended()) {
+            FfpExtendedAttribs.setNeutralCurrentValues();
+        }
         GLStateManager.instancedFfpDrawActive = true;
         for (int b = 0, n = liveBuckets.size(); b < n; b++) {
             final Bucket bucket = liveBuckets.get(b);

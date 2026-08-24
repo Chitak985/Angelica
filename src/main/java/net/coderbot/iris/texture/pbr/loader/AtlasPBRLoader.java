@@ -20,8 +20,10 @@ import net.coderbot.iris.texture.util.ImageManipulationUtil;
 import net.coderbot.iris.texture.util.TextureExporter;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.renderer.texture.TextureMap;
+import net.minecraft.client.renderer.texture.TextureUtil;
 import net.minecraft.client.resources.IResource;
 import net.minecraft.client.resources.IResourceManager;
+import net.minecraft.client.resources.data.AnimationFrame;
 import net.minecraft.client.resources.data.AnimationMetadataSection;
 import net.minecraft.util.ResourceLocation;
 import org.apache.commons.lang3.tuple.Pair;
@@ -29,7 +31,10 @@ import org.apache.commons.lang3.tuple.Pair;
 import javax.annotation.Nullable;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.List;
 import java.util.Objects;
 
 public class AtlasPBRLoader implements PBRTextureLoader<TextureMap> {
@@ -92,6 +97,41 @@ public class AtlasPBRLoader implements PBRTextureLoader<TextureMap> {
         }
     }
 
+    @Nullable
+    private static NativeImage padAnisotropic(NativeImage image, int frameWidth, int frameHeight) {
+        final int width = image.getWidth();
+        final int height = image.getHeight();
+        final int frames = (frameWidth == width && frameHeight > 0) ? height / frameHeight : 0;
+        if (frames < 1) {
+            return null;
+        }
+
+        final int paddedWidth = frameWidth + 16;
+        final int paddedHeight = frameHeight + 16;
+        final int framePixels = paddedWidth * paddedHeight;
+
+        final NativeImage padded = new NativeImage(paddedWidth, paddedHeight * frames, false);
+        final int[] frame = new int[framePixels];
+        for (int f = 0; f < frames; f++) {
+            Arrays.fill(frame, 0);
+            image.getRGB(0, f * frameHeight, frameWidth, frameHeight, frame, 0, frameWidth);
+            TextureUtil.prepareAnisotropicData(frame, frameWidth, frameHeight, 8);
+            padded.setRGB(0, f * paddedHeight, paddedWidth, paddedHeight, frame, 0, paddedWidth);
+        }
+        return padded;
+    }
+
+    private static AnimationMetadataSection withFrameSize(AnimationMetadataSection src, int frameWidth, int frameHeight) {
+        final List<AnimationFrame> frames = new ArrayList<>(src.getFrameCount());
+        for (int f = 0; f < src.getFrameCount(); f++) {
+            frames.add(new AnimationFrame(src.getFrameIndex(f), src.frameHasTime(f) ? src.getFrameTimeSingle(f) : -1));
+        }
+        return new AnimationMetadataSection(frames,
+            src.getFrameWidth() != -1 ? frameWidth : -1,
+            src.getFrameHeight() != -1 ? frameHeight : -1,
+            src.getFrameTime());
+    }
+
     protected static int fetchAtlasMipLevel(TextureMap texMap) {
         return texMap.mipmapLevels;
     }
@@ -146,11 +186,8 @@ public class AtlasPBRLoader implements PBRTextureLoader<TextureMap> {
                 frameWidth = targetFrameWidth;
                 frameHeight = targetFrameHeight;
 
-                if (animationMetadata.getFrameWidth() != -1) {
-                    animationMetadata.frameWidth = frameWidth;
-                }
-                if (animationMetadata.getFrameHeight() != -1) {
-                    animationMetadata.frameHeight = frameHeight;
+                if (animationMetadata.getFrameWidth() != -1 || animationMetadata.getFrameHeight() != -1) {
+                    animationMetadata = withFrameSize(animationMetadata, frameWidth, frameHeight);
                 }
             }
 
@@ -159,7 +196,15 @@ public class AtlasPBRLoader implements PBRTextureLoader<TextureMap> {
 
             final int x = sprite.getOriginX();
             final int y = sprite.getOriginY();
-            pbrSprite = new PBRTextureAtlasSprite(pbrSpriteInfo, animationMetadata, atlasWidth, atlasHeight, x, y, nativeImage, sprite.useAnisotropicFiltering, mipLevel);
+            boolean padInLoadSprite = sprite.useAnisotropicFiltering;
+            if (padInLoadSprite) {
+                final NativeImage padded = padAnisotropic(nativeImage, frameWidth, frameHeight);
+                if (padded != null) {
+                    nativeImage = padded;
+                    padInLoadSprite = false;
+                }
+            }
+            pbrSprite = new PBRTextureAtlasSprite(pbrSpriteInfo, animationMetadata, atlasWidth, atlasHeight, x, y, nativeImage, padInLoadSprite, mipLevel);
             syncAnimation(sprite, pbrSprite);
         } catch (FileNotFoundException e) {
             //

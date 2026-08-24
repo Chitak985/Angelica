@@ -16,10 +16,10 @@ public class ProgramCreator {
 
 	private static final Logger LOGGER = LogManager.getLogger("ProgramCreator");
 
-	public static final int MC_ENTITY = 11;
+	public static final int MC_ENTITY = ImmediateExtendedAttribHandler.LOC_MC_ENTITY;
 	public static final int MC_MID_TEX_COORD = ImmediateExtendedAttribHandler.LOC_MID_TEX;
 	public static final int AT_TANGENT = ImmediateExtendedAttribHandler.LOC_TANGENT;
-	public static final int AT_MIDBLOCK = 14;
+	public static final int AT_MIDBLOCK = ImmediateExtendedAttribHandler.LOC_MIDBLOCK;
 
 	public static int create(String name, GlShader... shaders) {
 		int program = GLStateManager.glCreateProgram();

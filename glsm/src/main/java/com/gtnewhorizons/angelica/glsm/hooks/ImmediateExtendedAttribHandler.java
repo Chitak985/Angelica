@@ -8,8 +8,10 @@ import org.lwjgl.opengl.GL11;
 public interface ImmediateExtendedAttribHandler {
 
     int EXT_STRIDE = 12;
+    int LOC_MC_ENTITY = 11;
     int LOC_MID_TEX = 12;
     int LOC_TANGENT = 13;
+    int LOC_MIDBLOCK = 14;
 
     int RAW_NORMAL_INDEX = 6;
 

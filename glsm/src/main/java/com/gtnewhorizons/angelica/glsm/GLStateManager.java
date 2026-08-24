@@ -57,6 +57,7 @@ import com.gtnewhorizons.angelica.glsm.states.TextureBinding;
 import com.gtnewhorizons.angelica.glsm.states.TextureUnitArray;
 import com.gtnewhorizons.angelica.glsm.texture.TextureInfo;
 import com.gtnewhorizons.angelica.glsm.texture.TextureInfoCache;
+import it.unimi.dsi.fastutil.ints.Int2IntMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.ints.IntStack;
@@ -5857,6 +5858,14 @@ public class GLStateManager {
             if (VAOManager.boundEBO == buffer) glBindBuffer(GL15.GL_ELEMENT_ARRAY_BUFFER, 0);
             if (glCtx.boundPixelUnpackBuffer == buffer) glBindBuffer(GL21.GL_PIXEL_UNPACK_BUFFER, 0);
             if (glCtx.boundPixelPackBuffer == buffer) glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
+            if (glCtx.boundCopyReadBuffer == buffer) glBindBuffer(GL31.GL_COPY_READ_BUFFER, 0);
+            if (glCtx.boundCopyWriteBuffer == buffer) glBindBuffer(GL31.GL_COPY_WRITE_BUFFER, 0);
+            for (Int2IntMap.Entry e : glCtx.boundOtherBuffers.int2IntEntrySet()) {
+                if (e.getIntValue() != buffer) continue;
+                e.setValue(0);
+                RENDER_BACKEND.bindBuffer(e.getIntKey(), 0);
+            }
+            glCtx.writeMappedBuffers.remove(buffer);
 
             VAOManager.onDeleteBuffer(buffer);
         } finally {
@@ -5864,20 +5873,30 @@ public class GLStateManager {
         }
     }
 
+    /** glBindBufferBase/Range also set the generic binding point, so they share this. */
+    private static void trackBufferBinding(GLContextState glCtx, int target, int buffer) {
+        if (target == GL15.GL_ARRAY_BUFFER) {
+            // if (boundVBO == buffer) return; TODO figure out why this breaks switching async occlusion mode
+            glCtx.boundVBO = buffer;
+        } else if (target == GL15.GL_ELEMENT_ARRAY_BUFFER) {
+            VAOManager.onBindEBO(buffer);
+        } else if (target == GL21.GL_PIXEL_UNPACK_BUFFER) {
+            glCtx.boundPixelUnpackBuffer = buffer;
+        } else if (target == GL21.GL_PIXEL_PACK_BUFFER) {
+            glCtx.boundPixelPackBuffer = buffer;
+        } else if (target == GL31.GL_COPY_READ_BUFFER) {
+            glCtx.boundCopyReadBuffer = buffer;
+        } else if (target == GL31.GL_COPY_WRITE_BUFFER) {
+            glCtx.boundCopyWriteBuffer = buffer;
+        } else {
+            glCtx.boundOtherBuffers.put(target, buffer);
+        }
+    }
+
     public static void glBindBuffer(int target, int buffer) {
-        final GLContextState glCtx = ctx();
         final boolean locked = acquireDrawLock();
         try {
-            if (target == GL15.GL_ARRAY_BUFFER) {
-                // if (boundVBO == buffer) return; TODO figure out why this breaks switching async occlusion mode
-                glCtx.boundVBO = buffer;
-            } else if (target == GL15.GL_ELEMENT_ARRAY_BUFFER) {
-                VAOManager.onBindEBO(buffer);
-            } else if (target == GL21.GL_PIXEL_UNPACK_BUFFER) {
-                glCtx.boundPixelUnpackBuffer = buffer;
-            } else if (target == GL21.GL_PIXEL_PACK_BUFFER) {
-                glCtx.boundPixelPackBuffer = buffer;
-            }
+            trackBufferBinding(ctx(), target, buffer);
             RENDER_BACKEND.bindBuffer(target, buffer);
         } finally {
             if (locked) releaseDrawLock();
@@ -5956,13 +5975,62 @@ public class GLStateManager {
         for (int i = 0; i < buffers.length; i++) buffers[i] = RENDER_BACKEND.createBuffers();
     }
 
+    private static final int MAP_PERSISTENT_BIT = 0x40;
+
+    private static int bufferForTarget(int target) {
+        final GLContextState glCtx = ctx();
+        if (target == GL15.GL_ARRAY_BUFFER) return glCtx.boundVBO;
+        if (target == GL15.GL_ELEMENT_ARRAY_BUFFER) return VAOManager.boundEBO;
+        if (target == GL31.GL_COPY_READ_BUFFER) return glCtx.boundCopyReadBuffer;
+        if (target == GL31.GL_COPY_WRITE_BUFFER) return glCtx.boundCopyWriteBuffer;
+        if (target == GL21.GL_PIXEL_UNPACK_BUFFER) return glCtx.boundPixelUnpackBuffer;
+        if (target == GL21.GL_PIXEL_PACK_BUFFER) return glCtx.boundPixelPackBuffer;
+        return glCtx.boundOtherBuffers.get(target);
+    }
+
     private static void onBufferRespec(int target) {
         if (FfpExtendedAttribs.isEmpty()) return;
-        if (target == GL15.GL_ARRAY_BUFFER) {
-            FfpExtendedAttribs.onBufferRespecified(ctx().boundVBO);
-        } else if (target == GL15.GL_ELEMENT_ARRAY_BUFFER) {
-            FfpExtendedAttribs.onBufferRespecified(VAOManager.boundEBO);
+        final int buffer = bufferForTarget(target);
+        if (buffer != 0) FfpExtendedAttribs.onBufferRespecified(buffer);
+    }
+
+    private static void onBufferMap(int target, int access) {
+        if (access == GL15.GL_READ_ONLY) return;
+        markWriteMapped(target);
+        onBufferRespec(target);
+    }
+
+    private static void onBufferMapRange(int target, int access) {
+        if ((access & GL30.GL_MAP_WRITE_BIT) == 0) return;
+        if ((access & MAP_PERSISTENT_BIT) != 0) {
+            markPersistentlyMapped(target);
+            return;
         }
+        markWriteMapped(target);
+        onBufferRespec(target);
+    }
+
+    private static void markWriteMapped(int target) {
+        final int buffer = bufferForTarget(target);
+        if (buffer != 0) ctx().writeMappedBuffers.add(buffer);
+    }
+
+    private static void onBufferUnmap(int target) {
+        final int buffer = bufferForTarget(target);
+        if (buffer == 0 || !ctx().writeMappedBuffers.remove(buffer)) return;
+        onBufferRespec(target);
+    }
+
+    private static void onBufferStorage(int target, int flags) {
+        if ((flags & MAP_PERSISTENT_BIT) != 0) {
+            markPersistentlyMapped(target);
+            return;
+        }
+        onBufferRespec(target);
+    }
+
+    private static void markPersistentlyMapped(int target) {
+        FfpExtendedAttribs.markPersistent(bufferForTarget(target));
     }
 
     private static void onNamedBufferRespec(int buffer) {
@@ -6037,13 +6105,13 @@ public class GLStateManager {
 
     public static void nglBufferSubData(int target, long offset, long size, long data) { glBufferSubData(target, offset, MemoryUtilities.memByteBuffer(data, checkedSize(size))); }
 
-    public static ByteBuffer glMapBuffer(int target, int access) { return RENDER_BACKEND.mapBuffer(target, access); }
+    public static ByteBuffer glMapBuffer(int target, int access) { onBufferMap(target, access); return RENDER_BACKEND.mapBuffer(target, access); }
     public static ByteBuffer glMapBuffer(int target, int access, ByteBuffer old_buffer) { return glMapBuffer(target, access); }
-    public static ByteBuffer glMapBuffer(int target, int access, long length, ByteBuffer old_buffer) { return RENDER_BACKEND.mapBuffer(target, access, length, old_buffer); }
-    public static ByteBuffer glMapBufferRange(int target, long offset, long length, int access) { return RENDER_BACKEND.mapBufferRange(target, offset, length, access); }
+    public static ByteBuffer glMapBuffer(int target, int access, long length, ByteBuffer old_buffer) { onBufferMap(target, access); return RENDER_BACKEND.mapBuffer(target, access, length, old_buffer); }
+    public static ByteBuffer glMapBufferRange(int target, long offset, long length, int access) { onBufferMapRange(target, access); return RENDER_BACKEND.mapBufferRange(target, offset, length, access); }
     public static ByteBuffer glMapBufferRange(int target, long offset, long length, int access, ByteBuffer old_buffer) { return glMapBufferRange(target, offset, length, access); }
     public static void glFlushMappedBufferRange(int target, long offset, long length) { RENDER_BACKEND.flushMappedBufferRange(target, offset, length); }
-    public static boolean glUnmapBuffer(int target) { return RENDER_BACKEND.unmapBuffer(target); }
+    public static boolean glUnmapBuffer(int target) { onBufferUnmap(target); return RENDER_BACKEND.unmapBuffer(target); }
 
     public static void glGetBufferSubData(int target, long offset, ByteBuffer data) { RENDER_BACKEND.getBufferSubData(target, offset, data); }
     public static void glGetBufferSubData(int target, long offset, ShortBuffer data) { RENDER_BACKEND.getBufferSubData(target, offset, data); }
@@ -6090,8 +6158,8 @@ public class GLStateManager {
     public static void glGetBufferParameteriv(int target, int pname, IntBuffer params) { params.put(params.position(), glGetBufferParameteri(target, pname)); }
     public static void glGetBufferParameteriv(int target, int pname, int[] params) { params[0] = glGetBufferParameteri(target, pname); }
 
-    public static void glBufferStorage(int target, long size, int flags) { onBufferRespec(target); RENDER_BACKEND.bufferStorage(target, size, flags); }
-    public static void glBufferStorage(int target, ByteBuffer data, int flags) { onBufferRespec(target); RENDER_BACKEND.bufferStorage(target, data, flags); }
+    public static void glBufferStorage(int target, long size, int flags) { onBufferStorage(target, flags); RENDER_BACKEND.bufferStorage(target, size, flags); }
+    public static void glBufferStorage(int target, ByteBuffer data, int flags) { onBufferStorage(target, flags); RENDER_BACKEND.bufferStorage(target, data, flags); }
     public static void glBufferStorage(int target, ShortBuffer data, int flags) { glBufferStorage(target, MemoryUtilities.memByteBuffer(data), flags); }
     public static void glBufferStorage(int target, IntBuffer data, int flags) { glBufferStorage(target, MemoryUtilities.memByteBuffer(data), flags); }
     public static void glBufferStorage(int target, FloatBuffer data, int flags) { glBufferStorage(target, MemoryUtilities.memByteBuffer(data), flags); }
@@ -6182,15 +6250,15 @@ public class GLStateManager {
         MemoryUtilities.memFree(copy);
     }
 
-    public static void glClearBufferSubData(int target, int internalFormat, long offset, long size, int format, int type, ByteBuffer data) { RENDER_BACKEND.clearBufferSubData(target, internalFormat, offset, size, format, type, data); }
-    public static void glClearBufferData(int target, int internalformat, int format, int type, ByteBuffer data) { RENDER_BACKEND.clearBufferData(target, internalformat, format, type, data); }
+    public static void glClearBufferSubData(int target, int internalFormat, long offset, long size, int format, int type, ByteBuffer data) { onBufferRespec(target); RENDER_BACKEND.clearBufferSubData(target, internalFormat, offset, size, format, type, data); }
+    public static void glClearBufferData(int target, int internalformat, int format, int type, ByteBuffer data) { onBufferRespec(target); RENDER_BACKEND.clearBufferData(target, internalformat, format, type, data); }
     public static boolean glIsBuffer(int buffer) { return RENDER_BACKEND.isBuffer(buffer); }
     public static boolean glIsTexture(int texture) { return RENDER_BACKEND.isTexture(texture); }
     public static boolean glIsFramebuffer(int framebuffer) { return RENDER_BACKEND.isFramebuffer(framebuffer); }
     public static boolean glIsRenderbuffer(int renderbuffer) { return RENDER_BACKEND.isRenderbuffer(renderbuffer); }
     public static boolean glIsSampler(int sampler) { return RENDER_BACKEND.isSampler(sampler); }
     public static boolean glIsQuery(int query) { return RENDER_BACKEND.isQuery(query); }
-    public static void glCopyBufferSubData(int readTarget, int writeTarget, long readOffset, long writeOffset, long size) { RENDER_BACKEND.copyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size); }
+    public static void glCopyBufferSubData(int readTarget, int writeTarget, long readOffset, long writeOffset, long size) { onBufferRespec(writeTarget); RENDER_BACKEND.copyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size); }
 
     private static int checkedSize(long size) {
         if (size < 0 || size > Integer.MAX_VALUE) {
@@ -6354,7 +6422,26 @@ public class GLStateManager {
     public static void glGetQueryObjectui(int id, int pname, IntBuffer params) { RENDER_BACKEND.getQueryObjectui(id, pname, params); }
     public static int glGetQueryObjecti(int id, int pname) { return RENDER_BACKEND.getQueryObjecti(id, pname); }
 
-    public static void glBindBufferBase(int target, int index, int buffer) { RENDER_BACKEND.bindBufferBase(target, index, buffer); }
+    public static void glBindBufferBase(int target, int index, int buffer) {
+        final boolean locked = acquireDrawLock();
+        try {
+            trackBufferBinding(ctx(), target, buffer);
+            RENDER_BACKEND.bindBufferBase(target, index, buffer);
+        } finally {
+            if (locked) releaseDrawLock();
+        }
+    }
+
+    public static void glBindBufferRange(int target, int index, int buffer, long offset, long size) {
+        final boolean locked = acquireDrawLock();
+        try {
+            trackBufferBinding(ctx(), target, buffer);
+            RENDER_BACKEND.bindBufferRange(target, index, buffer, offset, size);
+        } finally {
+            if (locked) releaseDrawLock();
+        }
+    }
+
     public static int glGetUniformBlockIndex(int program, CharSequence name) { return RENDER_BACKEND.getUniformBlockIndex(program, name); }
     public static void glUniformBlockBinding(int program, int blockIndex, int binding) { RENDER_BACKEND.uniformBlockBinding(program, blockIndex, binding); }
     public static void glBindFragDataLocation(int program, int colorNumber, CharSequence name) { RENDER_BACKEND.bindFragDataLocation(program, colorNumber, name); }
@@ -6392,6 +6479,7 @@ public class GLStateManager {
         }
     }
     public static long nglMapBuffer(int target, int access) {
+        onBufferMap(target, access);
         final ByteBuffer buf = RENDER_BACKEND.mapBuffer(target, access);
         return buf == null ? 0L : MemoryUtilities.memAddress0(buf);
     }
@@ -6975,10 +7063,6 @@ public class GLStateManager {
 
         // GL defers deletion of a bound program until unbind; activeProgram stays set so the
         // cache matches GL_CURRENT_PROGRAM and the next glUseProgram is not skipped as redundant.
-        if (GLSMHooks.PROGRAM_DELETE.hasListeners()) {
-            GLSMHooks.programDeleteEvent.program = program;
-            GLSMHooks.PROGRAM_DELETE.post(GLSMHooks.programDeleteEvent);
-        }
         RENDER_BACKEND.deleteProgram(program);
     }
 
@@ -7703,6 +7787,14 @@ public class GLStateManager {
 
     public static int getBoundVBO() {
         return ctx().boundVBO;
+    }
+
+    public static int getBoundCopyReadBuffer() {
+        return ctx().boundCopyReadBuffer;
+    }
+
+    public static int getBoundCopyWriteBuffer() {
+        return ctx().boundCopyWriteBuffer;
     }
 
     public static int getBoundVAO() {
